@@ -1,9 +1,11 @@
+import json
 import os
 import streamlit as st
 
 import config
 import engine
 import payments
+import db
 
 config.load_environment()
 from engine import (
@@ -14,6 +16,68 @@ from engine import (
 )
 
 st.set_page_config(page_title="Demand2Deal | Autonomous Distributor", page_icon="⚡", layout="wide")
+
+# Simple top-level view selector
+view = st.sidebar.selectbox("View", ["App", "History"], index=0)
+if view == "History":
+    st.set_page_config(page_title="Demand2Deal | History", page_icon="📜", layout="wide")
+    st.title("📜 Purchase & Payment History")
+    st.markdown("A polished snapshot of the latest supplier purchases and payment verifications captured by the demo flow.")
+
+    purchases = db.get_purchases(200)
+    payments_list = db.get_payments(200)
+
+    col1, col2, col3 = st.columns([1.2, 1.2, 1.2])
+    col1.metric("Total Purchases", len(purchases), help="Successful and attempted supplier orders")
+    col2.metric("Total Payments", len(payments_list), help="Verified and simulated payment events")
+    col3.metric("Storage", "SQLite", help="Local history database")
+
+    st.markdown("---")
+    st.subheader("🛒 Purchases")
+    if purchases:
+        purchase_rows = []
+        for row in purchases:
+            details = json.loads(row.get("details", "{}") or "{}")
+            purchase_rows.append({
+                "ID": row.get("id"),
+                "Product": row.get("product", "—"),
+                "Supplier": row.get("supplier", "—"),
+                "Qty": row.get("quantity", 0),
+                "Status": row.get("status", "UNKNOWN"),
+                "Created": row.get("created_at", "—")[:19],
+                "Correlation": details.get("correlation_id", "—"),
+            })
+        st.dataframe(purchase_rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("No purchases recorded yet.")
+
+    st.subheader("💳 Payments")
+    if payments_list:
+        payment_rows = []
+        for row in payments_list:
+            details = json.loads(row.get("details", "{}") or "{}")
+            payment_rows.append({
+                "ID": row.get("id"),
+                "Order ID": row.get("razorpay_order_id", "—"),
+                "Payment ID": row.get("razorpay_payment_id", "—"),
+                "Verified": "✅ Yes" if row.get("verified") else "❌ No",
+                "Created": row.get("created_at", "—")[:19],
+                "Correlation": details.get("correlation_id", "—"),
+            })
+        st.dataframe(payment_rows, use_container_width=True, hide_index=True)
+    else:
+        st.info("No payments recorded yet.")
+
+    st.markdown("---")
+    c1, c2, c3 = st.columns([1, 1, 1.2])
+    c1.download_button("Download purchases (JSON)", data=str(purchases), file_name="purchases.json")
+    c2.download_button("Download payments (JSON)", data=str(payments_list), file_name="payments.json")
+    if c3.button("🗑️ Clear history"):
+        db.clear_history()
+        st.success("History cleared.")
+        st.rerun()
+
+    st.stop()
 
 st.markdown("""
 <style>
@@ -34,11 +98,29 @@ st.markdown("""
 # ---------------------------------------------------------------------------
 # Session state
 # ---------------------------------------------------------------------------
+def reset_workflow() -> None:
+    defaults = {
+        "step": "INPUT",
+        "demand": None,
+        "suppliers": None,
+        "plan": None,
+        "data_source": "live",
+        "razorpay_order": None,
+        "payment_verified": False,
+        "procurement_result": None,
+        "payment_note": "",
+        "rzp_processed_ids": set(),
+        "override_feasibility": False,
+        "prompt_text": "",
+    }
+    for key, default in defaults.items():
+        st.session_state[key] = default
+
 for key, default in [
     ("step", "INPUT"), ("demand", None), ("suppliers", None), ("plan", None),
     ("data_source", "live"), ("razorpay_order", None), ("payment_verified", False),
     ("procurement_result", None), ("payment_note", ""), ("rzp_processed_ids", set()),
-    ("override_feasibility", False),
+    ("override_feasibility", False), ("prompt_text", ""),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -62,6 +144,13 @@ if "rzp_payment_id" in qp and qp["rzp_payment_id"] not in st.session_state.rzp_p
 st.title("⚡ Demand2Deal — The Autonomous Distributor")
 st.caption("Commerce without Inventory | webcmd-powered · Web-wide supplier discovery · Real checkout automation")
 
+st.markdown("""
+<div style="padding: 18px 20px; border-radius: 14px; background: linear-gradient(135deg, #0f172a, #1d4ed8); color: white; margin-bottom: 18px;">
+  <strong>Launch a smarter RFQ flow</strong><br>
+  Describe what your customer needs, pick suppliers, and let the agent discover and compare options in one guided workflow.
+</div>
+""", unsafe_allow_html=True)
+
 # ---------------------------------------------------------------------------
 # Startup diagnostics
 # ---------------------------------------------------------------------------
@@ -76,6 +165,9 @@ if broken:
 # Sidebar: Agent Spending Mandate
 # ---------------------------------------------------------------------------
 st.sidebar.header("🛡️ Agent Spending Mandate")
+if st.sidebar.button("🧹 Start new RFQ", use_container_width=True):
+    reset_workflow()
+    st.rerun()
 st.sidebar.metric("Max Order Ceiling", f"₹{SPEND_MANDATE['max_order_spend']:,.0f}")
 st.sidebar.metric("Min Gross Margin", f"{SPEND_MANDATE['min_gross_margin']:.0%}")
 st.sidebar.metric("Max Price Movement", f"{SPEND_MANDATE['max_price_movement_pct']:.0%}")
@@ -95,12 +187,25 @@ else:
 # ---------------------------------------------------------------------------
 # Step 1: Human Prompt Input
 # ---------------------------------------------------------------------------
-st.subheader("1. What does your customer need?")
-hero_prompt_default = "Need 5 Raspberry Pi 5 8GB units delivered in Bengaluru within 3 days. Maximum customer price ₹10,000 each. Minimum margin 8%."
-prompt = st.text_area("RFQ Prompt", value=hero_prompt_default, height=75)
+st.subheader("1. Describe the customer request")
+st.info("Enter the request in plain English. The more specific the request, the better the agent can rank suppliers.")
+
+example_prompts = {
+    "Mobile": "Need 5 iPhone 17 units delivered in Bengaluru within 3 days. Maximum customer price ₹10,000 each. Minimum margin 8%.",
+    "Electronics": "Need 8 Raspberry Pi 5 8GB units delivered in Mumbai within 4 days. Maximum customer price ₹9,500 each. Minimum margin 10%.",
+    "Accessories": "Need 12 Logitech MX Keys Mini keyboards delivered in Delhi within 2 days. Maximum customer price ₹7,000 each. Minimum margin 9%.",
+}
+example_cols = st.columns(3)
+for col, (label, example) in zip(example_cols, example_prompts.items()):
+    if col.button(f"✨ {label}", use_container_width=True):
+        st.session_state.prompt_text = example
+        st.rerun()
+
+prompt = st.text_area("Your RFQ prompt", key="prompt_text", placeholder="Type the customer request here…", height=95)
 
 # Supplier selection widget
-st.markdown("**Select suppliers to query** (fewer = faster):")
+st.markdown("**2. Choose suppliers to query**")
+st.caption("Fewer suppliers usually means faster results.")
 all_supplier_options = {s["supplier_id"]: s["name"] for s in SUPPLIER_SOURCES}
 all_supplier_options["web_discovery"] = "Open Web Discovery (webcmd search)"
 webcmd_supercharge = st.checkbox(
@@ -120,7 +225,7 @@ selected_suppliers = st.multiselect(
     help="Only selected suppliers will be queried. Amazon.in + Flipkart + web discovery is a webcmd-first flow.",
 )
 
-if st.button("🚀 Process Demand & Discover Suppliers", type="primary"):
+if st.button("🚀 Run discovery & optimize", type="primary"):
     if not prompt.strip():
         st.warning("Enter what the customer needs first.")
     else:
@@ -160,11 +265,10 @@ if st.button("🚀 Process Demand & Discover Suppliers", type="primary"):
 # ---------------------------------------------------------------------------
 if st.session_state.step == "NO_RESULTS":
     st.error(
-        "No matching suppliers came back from live search. This usually means a site's "
-        "anti-bot layer blocked the request, the target page changed, or the network at "
-        "your venue is flaky."
+        "No matching suppliers came back from live search. The app will not invent reference fallback rows automatically. "
+        "Try a different product term, a broader supplier set, or use reference pricing only if you explicitly want to continue the demo."
     )
-    if st.button("📋 Use reference pricing to keep the demo moving (clearly marked as non-live)"):
+    if st.button("📋 Continue with reference pricing", type="secondary"):
         demand = st.session_state.demand
         suppliers = get_reference_fallback_quotes(demand)
         plan = optimize_supply_chain(demand, suppliers)
@@ -187,6 +291,11 @@ if st.session_state.step in ["OPTIMIZED", "PROCURING", "PAID"]:
         st.stop()
 
     st.markdown("---")
+    phase_badge = "<span class=\"badge-live\">● LIVE RUN</span>" if st.session_state.step in ["OPTIMIZED", "PROCURING", "PAID"] else "<span class=\"badge-reference\">◐ READY TO RUN</span>"
+    st.markdown(
+        f"<div style='display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:10px;'>{phase_badge}<span class='badge-web'>⚙️ Guided RFQ workflow</span></div>",
+        unsafe_allow_html=True,
+    )
     badge = (
         '<span class="badge-live">● LIVE DATA</span>' if st.session_state.data_source == "live"
         else '<span class="badge-reference">◐ REFERENCE DATA (not live)</span>'
@@ -213,6 +322,7 @@ if st.session_state.step in ["OPTIMIZED", "PROCURING", "PAID"]:
     else:
         # Supplier table with columns
         cols = st.columns(7)
+        st.caption("Tap a supplier row to review its fit against the mandate and commercial constraints.")
         for c, label in zip(cols, ["**Supplier**", "**Stock**", "**Unit Cost**", "**MOQ**", "**Delivery**", "**Compat**", "**Agent Decision**"]):
             c.write(label)
 
@@ -289,6 +399,7 @@ if st.session_state.step in ["OPTIMIZED", "PROCURING", "PAID"]:
             if st.session_state.step == "OPTIMIZED":
                 if st.session_state.get("simulated_payment") is None:
                     st.session_state.simulated_payment = engine.simulate_payment_flow(demand, plan)
+                st.markdown("### 4. Customer quote & payment")
 
                 payment = st.session_state.simulated_payment
                 invoice = payment["invoice"]
@@ -315,6 +426,21 @@ if st.session_state.step in ["OPTIMIZED", "PROCURING", "PAID"]:
                 st.caption("This is a demo invoice for a simulated customer payment authorization; no actual funds are transferred.")
 
                 if st.button("✅ Simulate Customer Payment and proceed to supplier checkout", type="primary"):
+                    try:
+                        db.record_payment(
+                            None,
+                            None,
+                            None,
+                            True,
+                            details={
+                                "mode": "simulated",
+                                "invoice_number": invoice["invoice_number"],
+                                "note": f"Simulated payment for {invoice['invoice_number']}",
+                                "correlation_id": f"sim-{invoice['invoice_number']}",
+                            },
+                        )
+                    except Exception:
+                        pass
                     st.session_state.payment_verified = True
                     st.session_state.step = "PROCURING"
                     st.session_state.payment_note = f"Simulated invoice {invoice['invoice_number']} paid."
@@ -336,15 +462,47 @@ if st.session_state.step == "PROCURING":
         result = execute_supplier_procurement(demand, plan, suppliers, override_checks=st.session_state.get("override_feasibility", False))
         st.session_state.procurement_result = result
 
+        try:
+            if result.get("orders"):
+                for order in result.get("orders", []):
+                    db.record_purchase(
+                        product=demand.product,
+                        quantity=order.get("quantity", demand.target_qty),
+                        supplier=order.get("supplier") or order.get("supplier_name") or order.get("name") or "",
+                        product_url=order.get("product_url", ""),
+                        status=order.get("status", result.get("status", "UNKNOWN")),
+                        details={
+                            "note": order.get("note", ""),
+                            "correlation_id": f"proc-{demand.product}-{order.get('supplier','')}-{order.get('quantity', demand.target_qty)}",
+                        },
+                    )
+            else:
+                db.record_purchase(
+                    product=demand.product,
+                    quantity=demand.target_qty,
+                    supplier="",
+                    product_url="",
+                    status=result.get("status", "UNKNOWN"),
+                    details={
+                        "note": "Summary procurement record created from app flow",
+                        "correlation_id": f"proc-{demand.product}-{demand.target_qty}",
+                    },
+                )
+        except Exception:
+            pass
+
         if result["status"] == "BLOCKED_BY_MANDATE":
             status.update(label="🛑 Blocked by Agent Spending Mandate", state="error")
         else:
             for step_info in result.get("payment_flow", {}).get("steps", []):
-                st.write(f"   • {step_info['action']} — {step_info['status']}")
-            for o in result["orders"]:
-                st.write(f"   • {o['supplier']}: {o['quantity']} units → {o['status']}")
+                st.write(f"   • {step_info.get('action', 'Step')} — {step_info.get('status', 'unknown')}")
+            for o in result.get("orders", []):
+                supplier_name = o.get("supplier") or o.get("supplier_name") or o.get("name") or "Unknown supplier"
+                quantity = o.get("quantity", 1)
+                status_value = o.get("status", "UNKNOWN")
+                st.write(f"   • {supplier_name}: {quantity} units → {status_value}")
                 for s in o.get("steps", []):
-                    st.write(f"     - {s['action']} — {s['status']}")
+                    st.write(f"     - {s.get('action', 'Step')} — {s.get('status', 'unknown')}")
             status.update(label="🎉 Order Sourced & Fulfilled!", state="complete")
 
     st.session_state.step = "PAID"
@@ -374,8 +532,8 @@ if st.session_state.step == "PAID":
         )
     else:
         order_lines = "".join(
-            f'<div style="margin-top:6px;font-size:0.95rem;">• {o["supplier"]}: {o["quantity"]} units — '
-            f'<strong>{o["status"].replace("_"," ")}</strong></div>'
+            f'<div style="margin-top:6px;font-size:0.95rem;">• {o.get("supplier") or o.get("supplier_name") or o.get("name") or "Unknown supplier"}: {o.get("quantity", 1)} units — '
+            f'<strong>{str(o.get("status", "UNKNOWN")).replace("_", " ")}</strong></div>'
             for o in result.get("orders", [])
         )
         badge = (

@@ -429,10 +429,19 @@ def generate_content_with_fallback(contents: str, response_schema=None, system_i
 def _parse_rfq_locally(user_prompt: str) -> CustomerDemand:
     text = user_prompt.lower()
 
-    # Product: prefer a compact phrase after "need" or before "units".
-    product_match = re.search(r"need\s+(.*?)\s+(?:units|unit|for)", user_prompt, re.IGNORECASE)
-    product = product_match.group(1).strip() if product_match else user_prompt.strip()
+    # Product: prefer the phrase after "need"/"for" and before the next structural cue.
+    product = user_prompt.strip()
+    for pattern in [
+        r"\bneed\s+(?:(?:\d+|[a-z]+)\s+)?(.+?)(?=\s+(?:units?|unit|delivered|within|maximum|minimum|for|and|₹|rs\.?|rupees?|$))",
+        r"\bfor\s+(?:(?:\d+|[a-z]+)\s+)?(.+?)(?=\s+(?:units?|unit|delivered|within|maximum|minimum|for|and|₹|rs\.?|rupees?|$))",
+    ]:
+        match = re.search(pattern, user_prompt, re.IGNORECASE)
+        if match:
+            product = match.group(1).strip()
+            break
+
     product = re.sub(r"\s+", " ", product)
+    product = re.sub(r"^\d+\s+", "", product)
     if product.endswith("."):
         product = product[:-1]
 
@@ -1042,8 +1051,9 @@ def fetch_all_live_suppliers(demand: CustomerDemand, selected_supplier_ids: Opti
     if quotes:
         return quotes
 
-    # Deterministic fallback for demo continuity
-    return get_reference_fallback_quotes(demand)
+    # Do not inject reference fallback quotes automatically for empty live results.
+    # The app can opt into reference pricing explicitly when desired.
+    return []
 
 
 def get_reference_fallback_quotes(demand: CustomerDemand) -> List[SupplierQuote]:
@@ -1450,6 +1460,9 @@ def _execute_webcmd_checkout(
             "status": "SIMULATED",
             "note": "No product URL available — cannot drive webcmd checkout.",
             "steps": [],
+            "product_url": supplier.product_url,
+            "supplier": supplier.name,
+            "quantity": quantity,
         }
 
     session = f"d2d_checkout_{supplier.supplier_id}"
@@ -1502,6 +1515,9 @@ def _execute_webcmd_checkout(
             "status": "FAILED",
             "note": f"Could not open product page: {open_res.get('stderr', '')[:200]}",
             "steps": [{"action": "Open product page", "status": "failed"}],
+            "product_url": supplier.product_url,
+            "supplier": supplier.name,
+            "quantity": quantity,
         }
     steps.append({"action": f"Opened product page: {supplier.product_url}", "status": "completed"})
     time.sleep(1)
@@ -1668,6 +1684,21 @@ def execute_supplier_procurement(
     """
     mandate_result = revalidate_mandate_before_purchase(demand, plan, suppliers, override_checks=override_checks)
     if not mandate_result.passed:
+        try:
+            from db import record_purchase
+            record_purchase(
+                product=demand.product,
+                quantity=demand.target_qty,
+                supplier="",
+                product_url="",
+                status="BLOCKED_BY_MANDATE",
+                details={
+                    "note": "Procurement blocked by mandate before supplier execution",
+                    "correlation_id": f"proc-{demand.product}-{demand.target_qty}",
+                },
+            )
+        except Exception:
+            pass
         return {
             "status": "BLOCKED_BY_MANDATE",
             "mandate": mandate_result.model_dump(),
@@ -1713,6 +1744,46 @@ def execute_supplier_procurement(
 
     all_success = all(r.get("status") == "SUCCESS" for r in results)
     overall_status = "SUCCESS" if all_success else "PARTIAL"
+
+    # Persist successful orders to SQLite history (best-effort)
+    try:
+        from db import record_purchase
+        if results:
+            for r in results:
+                try:
+                    supplier_name = r.get("supplier") or r.get("supplier_name") or r.get("name") or ""
+                    quantity = r.get("quantity", 1)
+                    if supplier_name or r.get("product_url") or quantity is not None:
+                        record_purchase(
+                            product=demand.product,
+                            quantity=quantity,
+                            supplier=supplier_name,
+                            product_url=r.get("product_url", ""),
+                            status=r.get("status", "UNKNOWN"),
+                            details={
+                                "steps": r.get("steps", []),
+                                "note": r.get("note", ""),
+                                "correlation_id": f"proc-{demand.product}-{supplier_name}-{quantity}",
+                            },
+                        )
+                except Exception:
+                    continue
+        else:
+            record_purchase(
+                product=demand.product,
+                quantity=demand.target_qty,
+                supplier="",
+                product_url="",
+                status=overall_status,
+                details={
+                    "steps": [],
+                    "note": "Procurement completed without supplier order details",
+                    "correlation_id": f"proc-{demand.product}-{demand.target_qty}",
+                },
+            )
+    except Exception:
+        # db integration is best-effort; do not let failures break procurement
+        pass
 
     _append_audit_event(AuditEvent(
         timestamp=datetime.utcnow().isoformat(),

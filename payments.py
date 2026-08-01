@@ -98,8 +98,22 @@ def verify_payment(razorpay_order_id: str, razorpay_payment_id: str, razorpay_si
                 "razorpay_signature": razorpay_signature,
             }
         )
+        # record to sqlite history if available
+        try:
+            from db import record_payment
+
+            record_payment(razorpay_order_id, razorpay_payment_id, razorpay_signature, True, details={})
+        except Exception:
+            pass
         return True
     except razorpay.errors.SignatureVerificationError:
+        # record failed verification too
+        try:
+            from db import record_payment
+
+            record_payment(razorpay_order_id, razorpay_payment_id, razorpay_signature, False, details={})
+        except Exception:
+            pass
         return False
 
 
